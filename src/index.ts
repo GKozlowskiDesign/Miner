@@ -1,71 +1,143 @@
 /* eslint-disable no-console */
+import 'dotenv/config';
+import os from 'node:os';
 
-// ---- Env -------------------------------------------------------------------
-const WALLET = process.env.WALLET || 'DEMO_WALLET';
-const HOST_ID = process.env.HOST_ID || 'HOST-LOCAL';
-const COORD   = process.env.COORD || process.env.COORDINATOR_URL || 'http://localhost:8787';
+const WALLET    = process.env.WALLET || '';
+const HOST_ID   = process.env.HOST_ID || 'HOST-3090-1';
+const DEVICE_ID = process.env.DEVICE_ID || os.hostname();
+const COORD     = process.env.COORD || 'http://127.0.0.1:8787';
 
-console.log(`[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} COORD=${COORD}`);
+if (!WALLET) {
+  console.error('[miner] WALLET required');
+  process.exit(1);
+}
 
-// Node 18+ has global fetch. If using older Node, add:  import('node-fetch')
-type HostState = { hostId: string; enabled: boolean; wallet?: string };
+type HelloResp = {
+  ok: boolean;
+  bound?: boolean;
+  hostId?: string;
+  deviceId?: string;
+  wallet?: string;
+  error?: string;
+};
 
-let enabled = false;
-let lastStatePrinted = '';
+type HostState = {
+  hostId: string;
+  enabled: boolean;
+  wallet: string | null;
+  controller?: string | null;
+  attached?: string | null;
+  deviceId?: string | null;
+};
 
-// Poll /host-state to decide if we’re allowed to mine
-async function refreshHostState() {
+type ShareResp = { ok?: boolean; total?: number; error?: string };
+
+const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Call /host/hello to bind device->host (or confirm binding)
+async function hello(): Promise<HelloResp> {
   try {
-    const r = await fetch(`${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`);
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const j = (await r.json()) as HostState;
-    enabled = !!j.enabled;
-
-    const tag = enabled ? 'ENABLED' : 'DISABLED';
-    const line = `[miner] host=${j.hostId} state=${tag} owner=${j.wallet ?? '-'} wallet=${WALLET}`;
-    if (line !== lastStatePrinted) {
-      console.log(line);
-      lastStatePrinted = line;
-    }
+    const r = await fetch(`${COORD}/host/hello`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        hostId: HOST_ID,
+        deviceId: DEVICE_ID,
+        wallet: WALLET,
+      }),
+    });
+    const j = (await r.json()) as HelloResp;
+    return j;
   } catch (e: any) {
-    enabled = false;
-    const line = `[miner] host-state error: ${e?.message || e}`;
-    if (line !== lastStatePrinted) {
-      console.warn(line);
-      lastStatePrinted = line;
-    }
+    return { ok: false, error: e?.message || 'hello_failed' };
   }
 }
 
-// Random “work” score to simulate difficulty
-const jitter = (min: number, max: number) => Math.floor(min + Math.random() * (max - min + 1));
-
-// Only post shares when enabled === true
-async function postShare() {
-  if (!enabled) return; // gate
+// Read enabled flag from /host-state
+async function hostState(): Promise<HostState | null> {
   try {
-    const difficulty = jitter(1, 5);
+    const r = await fetch(`${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`);
+    return (await r.json()) as HostState;
+  } catch {
+    return null;
+  }
+}
+
+async function share(diff: number): Promise<ShareResp> {
+  try {
     const r = await fetch(`${COORD}/share`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ wallet: WALLET, hostId: HOST_ID, difficulty }),
+      body: JSON.stringify({
+        wallet: WALLET,
+        hostId: HOST_ID,
+        deviceId: DEVICE_ID,
+        difficulty: diff,
+      }),
     });
-
-    const j = await r.json();
-    if (!r.ok) {
-      console.error('[miner] share failed', j);
-      return;
-    }
-    console.log(`[miner] share ok diff=${difficulty} total=${j.total}`);
+    const j = (await r.json()) as ShareResp;
+    if (!r.ok) return { ok: false, error: j?.error || `http_${r.status}` };
+    return j;
   } catch (e: any) {
-    console.error('[miner] share error', e?.message || e);
+    return { ok: false, error: e?.message || 'share_failed' };
   }
 }
 
-// Kick off loops
-refreshHostState();
-setInterval(refreshHostState, 4000); // check gate every 4s
-setInterval(postShare, 5000);        // attempt a share every 5s (only fires if enabled)
+// Strict gate:
+// - loop hello() until bound
+// - check enabled via /host-state
+// - only share when enabled
+async function main() {
+  console.log(
+    `[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`
+  );
 
-// Safety
-process.on('unhandledRejection', (e) => console.error('[miner] unhandled', e));
+  for (;;) {
+    const h = await hello();
+    if (!h.ok) {
+      console.log(`[miner] hello failed ${h.error || ''}`.trim());
+      await delay(2000);
+      continue;
+    }
+    if (!h.bound) {
+      console.log(`[miner] not bound yet (host=${HOST_ID} device=${DEVICE_ID}). Waiting…`);
+      await delay(2000);
+      continue;
+    }
+
+    const s = await hostState();
+    if (!s?.enabled) {
+      console.log('[miner] host is DISABLED. Waiting to be enabled…');
+      await delay(3000);
+      continue;
+    }
+
+    console.log('[miner] ENABLED & BOUND. Starting share loop.');
+    // Share loop
+    while (true) {
+      // re-check enabled every few iterations (cheap)
+      const randomGate = Math.random() < 0.05;
+      if (randomGate) {
+        const now = await hostState();
+        if (!now?.enabled) {
+          console.log('[miner] host turned OFF. Pausing…');
+          break;
+        }
+      }
+
+      const diff = Math.floor(Math.random() * 4) + 1; // demo difficulty 1..4
+      const r = await share(diff);
+      if (!r.ok) {
+        console.log(`[miner] share blocked: ${r.error}`);
+        break; // go re-hello + re-check gate
+      }
+      console.log(`[miner] share ok diff=${diff} total=${r.total ?? 0}`);
+      await delay(750);
+    }
+  }
+}
+
+main().catch((e) => {
+  console.error('[miner] fatal', e);
+  process.exit(1);
+});
