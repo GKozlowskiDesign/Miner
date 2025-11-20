@@ -1,16 +1,46 @@
 /* eslint-disable no-console */
 import 'dotenv/config';
 import os from 'node:os';
+import { execSync } from 'node:child_process';
 
-const WALLET    = process.env.WALLET || '';
-const HOST_ID   = process.env.HOST_ID || 'HOST-3090-1';
+const WALLET = process.env.WALLET || '';
+const HOST_ID = process.env.HOST_ID || 'HOST-3090-1';
 const DEVICE_ID = process.env.DEVICE_ID || os.hostname();
-const COORD     = process.env.COORD || 'http://127.0.0.1:8787';
+const COORD = process.env.COORD || 'http://127.0.0.1:8787';
 
 if (!WALLET) {
   console.error('[miner] WALLET required');
   process.exit(1);
 }
+
+function detectGpuModel(): string | null {
+  // allow override for testing
+  if (process.env.GPU_MODEL && process.env.GPU_MODEL.trim()) {
+    return process.env.GPU_MODEL.trim();
+  }
+
+  try {
+    const out = execSync(
+      'nvidia-smi --query-gpu=name --format=csv,noheader,nounits',
+      { encoding: 'utf8' },
+    );
+    const line = out
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean)[0];
+    return line || null;
+  } catch (e: any) {
+    console.log(
+      '[miner] GPU auto-detect failed (nvidia-smi missing or no NVIDIA GPU).',
+      e?.message || '',
+    );
+    return null;
+  }
+}
+
+const GPU_MODEL = detectGpuModel();
+console.log(`[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`);
+console.log(`[miner] GPU_MODEL detected="${GPU_MODEL || ''}"`);
 
 type HelloResp = {
   ok: boolean;
@@ -28,6 +58,9 @@ type HostState = {
   controller?: string | null;
   attached?: string | null;
   deviceId?: string | null;
+  site?: string | null;
+  gpuReportedModel?: string | null;
+  gpuVerified?: boolean;
 };
 
 type ShareResp = { ok?: boolean; total?: number; error?: string };
@@ -44,6 +77,7 @@ async function hello(): Promise<HelloResp> {
         hostId: HOST_ID,
         deviceId: DEVICE_ID,
         wallet: WALLET,
+        gpuModel: GPU_MODEL || null,
       }),
     });
     const j = (await r.json()) as HelloResp;
@@ -53,10 +87,12 @@ async function hello(): Promise<HelloResp> {
   }
 }
 
-// Read enabled flag from /host-state
+// Read enabled flag + gpu info from /host-state
 async function hostState(): Promise<HostState | null> {
   try {
-    const r = await fetch(`${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`);
+    const r = await fetch(
+      `${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`,
+    );
     return (await r.json()) as HostState;
   } catch {
     return null;
@@ -86,12 +122,9 @@ async function share(diff: number): Promise<ShareResp> {
 // Strict gate:
 // - loop hello() until bound
 // - check enabled via /host-state
-// - only share when enabled
+// - **check gpuVerified** before starting share loop
+// - only share when enabled & gpuVerified
 async function main() {
-  console.log(
-    `[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`
-  );
-
   for (;;) {
     const h = await hello();
     if (!h.ok) {
@@ -100,7 +133,9 @@ async function main() {
       continue;
     }
     if (!h.bound) {
-      console.log(`[miner] not bound yet (host=${HOST_ID} device=${DEVICE_ID}). Waiting…`);
+      console.log(
+        `[miner] not bound yet (host=${HOST_ID} device=${DEVICE_ID}). Waiting…`,
+      );
       await delay(2000);
       continue;
     }
@@ -112,15 +147,29 @@ async function main() {
       continue;
     }
 
-    console.log('[miner] ENABLED & BOUND. Starting share loop.');
+    const reported = s.gpuReportedModel || null;
+    const gpuVerified = !!s.gpuVerified;
+
+    if (!gpuVerified) {
+      console.log(
+        `[miner] host enabled, GPU not verified yet. Coordinator sees="${reported || 'none'}".`,
+      );
+      await delay(5000);
+      continue;
+    }
+
+    console.log('[miner] ENABLED, BOUND & GPU VERIFIED. Starting share loop.');
+
     // Share loop
     while (true) {
-      // re-check enabled every few iterations (cheap)
+      // re-check enabled / gpuVerified every so often
       const randomGate = Math.random() < 0.05;
       if (randomGate) {
         const now = await hostState();
-        if (!now?.enabled) {
-          console.log('[miner] host turned OFF. Pausing…');
+        if (!now?.enabled || !now.gpuVerified) {
+          console.log(
+            '[miner] host turned OFF or GPU lost verification. Pausing…',
+          );
           break;
         }
       }
