@@ -39,7 +39,9 @@ function detectGpuModel(): string | null {
 }
 
 const GPU_MODEL = detectGpuModel();
-console.log(`[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`);
+console.log(
+  `[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`,
+);
 console.log(`[miner] GPU_MODEL detected="${GPU_MODEL || ''}"`);
 
 type HelloResp = {
@@ -65,7 +67,30 @@ type HostState = {
 
 type ShareResp = { ok?: boolean; total?: number; error?: string };
 
+type AiJob = {
+  id: number;
+  wallet: string;
+  model_id: string;
+  host_id: string | null;
+  prompt: string;
+  status: string;
+  result?: string | null;
+  error?: string | null;
+  created_ts: number;
+  updated_ts: number;
+  taken_device_id?: string | null;
+  taken_ts?: number | null;
+};
+
+type AiJobNextResp = {
+  ok?: boolean;
+  job?: AiJob | null;
+  error?: string;
+};
+
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// -------------------- Core coordinator calls --------------------
 
 // Call /host/hello to bind device->host (or confirm binding)
 async function hello(): Promise<HelloResp> {
@@ -99,6 +124,7 @@ async function hostState(): Promise<HostState | null> {
   }
 }
 
+// send fake mining shares (existing PoW-ish loop)
 async function share(diff: number): Promise<ShareResp> {
   try {
     const r = await fetch(`${COORD}/share`, {
@@ -119,12 +145,65 @@ async function share(diff: number): Promise<ShareResp> {
   }
 }
 
-// Strict gate:
-// - loop hello() until bound
-// - check enabled via /host-state
-// - **check gpuVerified** before starting share loop
-// - only share when enabled & gpuVerified
-async function main() {
+// -------------------- AI job worker helpers --------------------
+
+async function fetchNextAiJob(): Promise<AiJob | null> {
+  try {
+    const url = new URL(`${COORD}/ai/jobs/next`);
+    url.searchParams.set('hostId', HOST_ID);
+    url.searchParams.set('deviceId', DEVICE_ID);
+
+    const r = await fetch(url, { method: 'GET' });
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      console.log(
+        `[ai-worker] /ai/jobs/next http_${r.status} ${txt.slice(0, 120)}`,
+      );
+      return null;
+    }
+
+    const j = (await r.json()) as AiJobNextResp;
+    if (!j.ok) {
+      if (j.error) console.log('[ai-worker] next error', j.error);
+      return null;
+    }
+
+    return j.job ?? null;
+  } catch (e: any) {
+    console.log('[ai-worker] next failed', e?.message || e);
+    return null;
+  }
+}
+
+async function submitAiJobResult(
+  jobId: number,
+  result: string,
+  error?: string,
+): Promise<void> {
+  try {
+    const r = await fetch(`${COORD}/ai/jobs/${jobId}/result`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        result,
+        error: error || null,
+      }),
+    });
+
+    if (!r.ok) {
+      const txt = await r.text().catch(() => '');
+      console.log(
+        `[ai-worker] result http_${r.status} ${txt.slice(0, 120)}`,
+      );
+    }
+  } catch (e: any) {
+    console.log('[ai-worker] result failed', e?.message || e);
+  }
+}
+
+// -------------------- Mining worker (existing) --------------------
+
+async function miningWorker() {
   for (;;) {
     const h = await hello();
     if (!h.ok) {
@@ -158,7 +237,9 @@ async function main() {
       continue;
     }
 
-    console.log('[miner] ENABLED, BOUND & GPU VERIFIED. Starting share loop.');
+    console.log(
+      '[miner] ENABLED, BOUND & GPU VERIFIED. Starting share loop.',
+    );
 
     // Share loop
     while (true) {
@@ -186,7 +267,59 @@ async function main() {
   }
 }
 
-main().catch((e) => {
+// -------------------- AI worker (new) --------------------
+
+async function aiWorker() {
+  console.log('[ai-worker] starting AI job worker loop');
+  for (;;) {
+    try {
+      const s = await hostState();
+      if (!s?.enabled || !s.gpuVerified) {
+        console.log(
+          '[ai-worker] host disabled or GPU not verified; sleeping…',
+        );
+        await delay(5000);
+        continue;
+      }
+
+      const job = await fetchNextAiJob();
+      if (!job) {
+        await delay(4000);
+        continue;
+      }
+
+      console.log(
+        `[ai-worker] claimed job id=${job.id} model=${job.model_id} wallet=${job.wallet}`,
+      );
+      console.log('[ai-worker] prompt:\n', job.prompt);
+
+      // --- Stubbed "model" compute for now ---
+      const fakeResult =
+        `[SIMULATED MODEL OUTPUT]\n\n` +
+        `Model: ${job.model_id}\nHost: ${HOST_ID} / ${DEVICE_ID}\n\n` +
+        `Prompt:\n${job.prompt.slice(0, 200)}${
+          job.prompt.length > 200 ? '…' : ''
+        }`;
+
+      // Simulate some compute time
+      await delay(1500);
+
+      await submitAiJobResult(job.id, fakeResult);
+      console.log(`[ai-worker] completed job id=${job.id}`);
+    } catch (e: any) {
+      console.error('[ai-worker] error', e?.message || e);
+      await delay(5000);
+    }
+  }
+}
+
+// -------------------- Startup --------------------
+
+async function start() {
+  await Promise.all([miningWorker(), aiWorker()]);
+}
+
+start().catch((e) => {
   console.error('[miner] fatal', e);
   process.exit(1);
 });
