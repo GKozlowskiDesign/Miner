@@ -2,140 +2,87 @@
 import 'dotenv/config';
 import os from 'node:os';
 import { execSync } from 'node:child_process';
+import crypto from 'node:crypto'; 
 
+// --- CONFIGURATION ---
 const WALLET = process.env.WALLET || '';
 const HOST_ID = process.env.HOST_ID || 'HOST-3090-1';
 const DEVICE_ID = process.env.DEVICE_ID || os.hostname();
 const COORD = process.env.COORD || 'http://127.0.0.1:8787';
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
+
+// 5.5 is "Goldilocks" mode. 
+// 5 = Too fast. 
+// 6 = Too slow. 
+// 5.5 = Perfect (~5-10 seconds).
+const MINING_DIFFICULTY = 5.5; 
 
 if (!WALLET) {
   console.error('[miner] WALLET required');
   process.exit(1);
 }
 
+// --- GPU DETECTION ---
 function detectGpuModel(): string | null {
-  // allow override for testing
   if (process.env.GPU_MODEL && process.env.GPU_MODEL.trim()) {
     return process.env.GPU_MODEL.trim();
   }
-
   try {
     const out = execSync(
       'nvidia-smi --query-gpu=name --format=csv,noheader,nounits',
       { encoding: 'utf8' },
     );
-    const line = out
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean)[0];
+    const line = out.split('\n').map((l) => l.trim()).filter(Boolean)[0];
     return line || null;
   } catch (e: any) {
-    console.log(
-      '[miner] GPU auto-detect failed (nvidia-smi missing or no NVIDIA GPU).',
-      e?.message || '',
-    );
+    console.log('[miner] GPU detect failed (nvidia-smi missing).');
     return null;
   }
 }
 
 const GPU_MODEL = detectGpuModel();
-console.log(
-  `[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID} COORD=${COORD}`,
-);
-console.log(`[miner] GPU_MODEL detected="${GPU_MODEL || ''}"`);
+console.log(`[miner] boot WALLET=${WALLET} HOST_ID=${HOST_ID} DEVICE_ID=${DEVICE_ID}`);
+console.log(`[miner] GPU_MODEL="${GPU_MODEL || 'Unknown'}"`);
 
-type HelloResp = {
-  ok: boolean;
-  bound?: boolean;
-  hostId?: string;
-  deviceId?: string;
-  wallet?: string;
-  error?: string;
-};
-
-type HostState = {
-  hostId: string;
-  enabled: boolean;
-  wallet: string | null;
-  controller?: string | null;
-  attached?: string | null;
-  deviceId?: string | null;
-  site?: string | null;
-  gpuReportedModel?: string | null;
-  gpuVerified?: boolean;
-};
-
+// --- TYPES ---
+type HelloResp = { ok: boolean; bound?: boolean; hostId?: string; deviceId?: string; wallet?: string; error?: string; };
+type HostState = { hostId: string; enabled: boolean; wallet: string | null; gpuReportedModel?: string | null; gpuVerified?: boolean; };
 type ShareResp = { ok?: boolean; total?: number; error?: string };
-
-type AiJob = {
-  id: number;
-  wallet: string;
-  model_id: string;
-  host_id: string | null;
-  prompt: string;
-  status: string;
-  result?: string | null;
-  error?: string | null;
-  created_ts: number;
-  updated_ts: number;
-  taken_device_id?: string | null;
-  taken_ts?: number | null;
-};
-
-type AiJobNextResp = {
-  ok?: boolean;
-  job?: AiJob | null;
-  error?: string;
-};
+type AiJob = { id: number; wallet: string; model_id: string; prompt: string; status: string; result?: string | null; error?: string | null; };
+type AiJobNextResp = { ok?: boolean; job?: AiJob | null; error?: string; };
 
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// -------------------- Core coordinator calls --------------------
+// --- API CALLS ---
 
-// Call /host/hello to bind device->host (or confirm binding)
 async function hello(): Promise<HelloResp> {
   try {
     const r = await fetch(`${COORD}/host/hello`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        hostId: HOST_ID,
-        deviceId: DEVICE_ID,
-        wallet: WALLET,
-        gpuModel: GPU_MODEL || null,
-      }),
+      body: JSON.stringify({ hostId: HOST_ID, deviceId: DEVICE_ID, wallet: WALLET, gpuModel: GPU_MODEL || null }),
     });
-    const j = (await r.json()) as HelloResp;
-    return j;
+    return (await r.json()) as HelloResp;
   } catch (e: any) {
     return { ok: false, error: e?.message || 'hello_failed' };
   }
 }
 
-// Read enabled flag + gpu info from /host-state
 async function hostState(): Promise<HostState | null> {
   try {
-    const r = await fetch(
-      `${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`,
-    );
+    const r = await fetch(`${COORD}/host-state?hostId=${encodeURIComponent(HOST_ID)}`);
     return (await r.json()) as HostState;
   } catch {
     return null;
   }
 }
 
-// send fake mining shares (existing PoW-ish loop)
 async function share(diff: number): Promise<ShareResp> {
   try {
     const r = await fetch(`${COORD}/share`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        wallet: WALLET,
-        hostId: HOST_ID,
-        deviceId: DEVICE_ID,
-        difficulty: diff,
-      }),
+      body: JSON.stringify({ wallet: WALLET, hostId: HOST_ID, deviceId: DEVICE_ID, difficulty: diff }),
     });
     const j = (await r.json()) as ShareResp;
     if (!r.ok) return { ok: false, error: j?.error || `http_${r.status}` };
@@ -145,8 +92,6 @@ async function share(diff: number): Promise<ShareResp> {
   }
 }
 
-// -------------------- AI job worker helpers --------------------
-
 async function fetchNextAiJob(): Promise<AiJob | null> {
   try {
     const url = new URL(`${COORD}/ai/jobs/next`);
@@ -154,158 +99,144 @@ async function fetchNextAiJob(): Promise<AiJob | null> {
     url.searchParams.set('deviceId', DEVICE_ID);
 
     const r = await fetch(url, { method: 'GET' });
-    if (!r.ok) {
-      const txt = await r.text().catch(() => '');
-      console.log(
-        `[ai-worker] /ai/jobs/next http_${r.status} ${txt.slice(0, 120)}`,
-      );
-      return null;
-    }
+    if (!r.ok) return null;
 
     const j = (await r.json()) as AiJobNextResp;
-    if (!j.ok) {
-      if (j.error) console.log('[ai-worker] next error', j.error);
-      return null;
-    }
-
     return j.job ?? null;
-  } catch (e: any) {
-    console.log('[ai-worker] next failed', e?.message || e);
+  } catch {
     return null;
   }
 }
 
-async function submitAiJobResult(
-  jobId: number,
-  result: string,
-  error?: string,
-): Promise<void> {
+async function submitAiJobResult(jobId: number, result: string, error?: string): Promise<void> {
   try {
-    const r = await fetch(`${COORD}/ai/jobs/${jobId}/result`, {
+    await fetch(`${COORD}/ai/jobs/${jobId}/result`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        result,
-        error: error || null,
-      }),
+      body: JSON.stringify({ result, error: error || null }),
     });
-
-    if (!r.ok) {
-      const txt = await r.text().catch(() => '');
-      console.log(
-        `[ai-worker] result http_${r.status} ${txt.slice(0, 120)}`,
-      );
-    }
   } catch (e: any) {
-    console.log('[ai-worker] result failed', e?.message || e);
+    console.log('[ai-worker] result failed', e?.message);
   }
 }
 
-// -------------------- Mining worker (existing) --------------------
+async function runOllamaInference(modelId: string, prompt: string): Promise<string> {
+  const engineModel = modelId.toLowerCase().includes('mistral') ? 'mistral' : 'llama3.1';
+
+  const r = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: engineModel, prompt: prompt, stream: false }),
+  });
+
+  if (!r.ok) throw new Error(`Ollama API error: ${r.statusText}`);
+  const data: any = await r.json();
+  return data.response; 
+}
+
+// -------------------- FRACTIONAL MINING LOGIC --------------------
+
+function minePoW(difficulty: number) {
+  // Separate integer (5) from fraction (0.5)
+  const intDiff = Math.floor(difficulty); 
+  const fracDiff = difficulty - intDiff;
+
+  // e.g. "00000"
+  const targetPrefix = '0'.repeat(intDiff);
+  
+  // Logic for the Next Character (the fraction):
+  // Hex has 16 chars (0-f). 
+  // If frac is 0.5, we want the top 50% (0-7).
+  // If frac is 0.9, we want the top 10% (0-1).
+  const maxNextCharVal = Math.floor(16 * (1 - fracDiff));
+
+  let nonce = 0;
+  const start = Date.now();
+  const prefix = `${HOST_ID}-${DEVICE_ID}-${start}`;
+
+  while (true) {
+    const input = `${prefix}-${nonce}`;
+    const hash = crypto.createHash('sha256').update(input).digest('hex');
+
+    if (hash.startsWith(targetPrefix)) {
+      // Check the fractional requirement on the next character
+      if (fracDiff > 0) {
+        const nextChar = parseInt(hash[intDiff], 16);
+        if (nextChar <= maxNextCharVal) {
+             const duration = Date.now() - start;
+             return { nonce, hash, duration };
+        }
+      } else {
+        // No fraction, just integer match
+        const duration = Date.now() - start;
+        return { nonce, hash, duration };
+      }
+    }
+    nonce++;
+  }
+}
+
+// -------------------- MINING WORKER --------------------
 
 async function miningWorker() {
+  console.log(`[miner] ⛏️  Starting SHA-256 Miner (Difficulty ${MINING_DIFFICULTY})...`);
+
   for (;;) {
     const h = await hello();
-    if (!h.ok) {
-      console.log(`[miner] hello failed ${h.error || ''}`.trim());
-      await delay(2000);
-      continue;
-    }
-    if (!h.bound) {
-      console.log(
-        `[miner] not bound yet (host=${HOST_ID} device=${DEVICE_ID}). Waiting…`,
-      );
-      await delay(2000);
-      continue;
-    }
+    if (!h.bound) { await delay(2000); continue; }
 
     const s = await hostState();
-    if (!s?.enabled) {
-      console.log('[miner] host is DISABLED. Waiting to be enabled…');
-      await delay(3000);
-      continue;
-    }
-
-    const reported = s.gpuReportedModel || null;
-    const gpuVerified = !!s.gpuVerified;
-
-    if (!gpuVerified) {
-      console.log(
-        `[miner] host enabled, GPU not verified yet. Coordinator sees="${reported || 'none'}".`,
-      );
+    if (!s?.enabled || !s.gpuVerified) {
+      console.log('[miner] Host disabled or unverified. Pausing...');
       await delay(5000);
       continue;
     }
 
-    console.log(
-      '[miner] ENABLED, BOUND & GPU VERIFIED. Starting share loop.',
-    );
-
-    // Share loop
-    while (true) {
-      // re-check enabled / gpuVerified every so often
-      const randomGate = Math.random() < 0.05;
-      if (randomGate) {
-        const now = await hostState();
-        if (!now?.enabled || !now.gpuVerified) {
-          console.log(
-            '[miner] host turned OFF or GPU lost verification. Pausing…',
-          );
-          break;
-        }
-      }
-
-      const diff = Math.floor(Math.random() * 4) + 1; // demo difficulty 1..4
-      const r = await share(diff);
-      if (!r.ok) {
-        console.log(`[miner] share blocked: ${r.error}`);
-        break; // go re-hello + re-check gate
-      }
-      console.log(`[miner] share ok diff=${diff} total=${r.total ?? 0}`);
-      await delay(750);
+    // --- REAL WORK ---
+    const solution = minePoW(MINING_DIFFICULTY);
+    
+    const r = await share(MINING_DIFFICULTY);
+    
+    if (r.ok) {
+      console.log(`[miner] 💰 Share accepted! Time: ${solution.duration}ms | Total: ${r.total}`);
+    } else {
+      console.log(`[miner] Share rejected: ${r.error}`);
     }
+
+    await delay(50);
   }
 }
 
-// -------------------- AI worker (new) --------------------
+// -------------------- AI WORKER --------------------
 
 async function aiWorker() {
   console.log('[ai-worker] starting AI job worker loop');
   for (;;) {
     try {
       const s = await hostState();
-      if (!s?.enabled || !s.gpuVerified) {
-        console.log(
-          '[ai-worker] host disabled or GPU not verified; sleeping…',
-        );
-        await delay(5000);
-        continue;
-      }
+      if (!s?.enabled || !s.gpuVerified) { await delay(5000); continue; }
 
       const job = await fetchNextAiJob();
-      if (!job) {
-        await delay(4000);
-        continue;
+      if (!job) { await delay(2000); continue; } 
+
+      console.log(`[ai-worker] ⚡ Claimed Job #${job.id} (${job.model_id})`);
+      
+      let result = '';
+      let error = undefined;
+
+      try {
+        console.log(`[ai-worker] Sending to GPU (Ollama)...`);
+        result = await runOllamaInference(job.model_id, job.prompt);
+        console.log(`[ai-worker] Inference complete (${result.length} chars)`);
+      } catch (err: any) {
+        console.error('[ai-worker] Inference failed', err);
+        error = err.message || 'GPU_INFERENCE_FAILED';
+        result = 'Error generating response from GPU.';
       }
 
-      console.log(
-        `[ai-worker] claimed job id=${job.id} model=${job.model_id} wallet=${job.wallet}`,
-      );
-      console.log('[ai-worker] prompt:\n', job.prompt);
+      await submitAiJobResult(job.id, result, error);
+      console.log(`[ai-worker] Completed job id=${job.id}`);
 
-      // --- Stubbed "model" compute for now ---
-      const fakeResult =
-        `[SIMULATED MODEL OUTPUT]\n\n` +
-        `Model: ${job.model_id}\nHost: ${HOST_ID} / ${DEVICE_ID}\n\n` +
-        `Prompt:\n${job.prompt.slice(0, 200)}${
-          job.prompt.length > 200 ? '…' : ''
-        }`;
-
-      // Simulate some compute time
-      await delay(1500);
-
-      await submitAiJobResult(job.id, fakeResult);
-      console.log(`[ai-worker] completed job id=${job.id}`);
     } catch (e: any) {
       console.error('[ai-worker] error', e?.message || e);
       await delay(5000);
@@ -313,7 +244,7 @@ async function aiWorker() {
   }
 }
 
-// -------------------- Startup --------------------
+// -------------------- STARTUP --------------------
 
 async function start() {
   await Promise.all([miningWorker(), aiWorker()]);
